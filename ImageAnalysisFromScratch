@@ -81,3 +81,126 @@ Conectar con tu pipeline de R (exactamente el patrón que ya construimos)
 Solo si el proyecto lo exige, profundizar en MONAI/PyTorch para ajustar modelos propios
 
 #############################################################################################
+
+
+Paso 1 — Fundamentos de neuroimagen (conceptual, no técnico)
+Antes de tocar código, entender qué es una imagen de RM, 
+qué secuencias existen (T1, T2, FLAIR — esta última es la que se usa típicamente para ver lesiones de EM), 
+qué es la normalización espacial, qué es un atlas cerebral. Sin esto, cualquier herramienta que uses es una caja negra total.
+
+¿Qué es una imagen de RM, en esencia?
+Una resonancia magnética no mide "densidad de tejido" como un TAC (que usa rayos X). 
+Mide cómo responden los átomos de hidrógeno (básicamente el agua y la grasa del tejido) 
+a un campo magnético y a pulsos de radiofrecuencia. 
+Distintos tejidos (sustancia gris, sustancia blanca, líquido cefalorraquídeo, una lesión desmielinizante) 
+tienen distinta cantidad de agua y distinta forma de "relajarse" después del pulso — 
+y eso es lo que se traduce en distintos niveles de brillo en la imagen.
+Lo importante conceptualmente: la misma cabeza física genera imágenes muy distintas según qué "secuencia" 
+(protocolo de adquisición) uses, porque cada secuencia pondera de forma distinta esas propiedades físicas 
+de relajación (llamadas T1 y T2, que dan nombre a las secuencias).
+
+
+Las tres secuencias que necesitas conocer
+T1 (ponderada en T1)
+
+El líquido cefalorraquídeo (LCR) se ve oscuro, la sustancia blanca se ve clara, la sustancia gris intermedia
+Es la mejor secuencia para ver anatomía estructural con detalle — 
+por eso es la que se usa para medir volúmenes (volumetría cerebral, atrofia). 
+Cuando en el script hablábamos de "volumen cerebral normalizado", 
+ese número normalmente sale de un análisis sobre T1
+Después de inyectar contraste (gadolinio), 
+en T1 es donde ves las lesiones que "captan gadolinio" (Gd+) — 
+eso indica lesiones activas, con la barrera hematoencefálica rota.
+Es el dato que en el script llamamos num_lesiones_gad
+
+T2 (ponderada en T2)
+
+Al revés que T1: el LCR se ve brillante/blanco, la sustancia blanca más oscura
+Sensible a patología en general — 
+cualquier proceso que aumente el contenido de agua en el tejido 
+(edema, desmielinización, gliosis) se ve como una zona hiperintensa (brillante)
+
+FLAIR (Fluid-Attenuated Inversion Recovery)
+
+Es, conceptualmente, una secuencia T2 a la que se le suprime la señal 
+del LCR (por eso "fluid-attenuated" — atenúa el fluido)
+Resultado: el LCR se ve oscuro (como en T1) pero el tejido 
+sigue teniendo el contraste sensible a patología de T2
+Por qué es la reina en EM: las lesiones de EM suelen estar cerca 
+de los ventrículos (periventriculares), que están llenos de LCR. 
+En una T2 normal, una lesión brillante pegada a LCR brillante se camufla —
+es difícil distinguir dónde termina el ventrículo y empieza la lesión. 
+Al suprimir la señal del LCR, la lesión (que sigue brillante) queda claramente
+contrastada contra un fondo oscuro. Por eso el volumen_lesion_T2_ml del script 
+en la práctica casi siempre se mide sobre FLAIR, aunque históricamente se siga 
+llamando "T2 lesion load" por convención del campo
+
+Regla mental simple para recordar cuál es cuál: en T1, el agua (LCR) es oscura; 
+en T2 y FLAIR, el agua es clara — 
+excepto que FLAIR "apaga" esa claridad del LCR específicamente, 
+dejando solo la patología brillante.
+
+Normalización espacial — un concepto distinto al que vimos antes
+Ojo, esto es una palabra que ya usamos con otro significado (normalizar biomarcadores). 
+Aquí "normalización espacial" significa algo completamente distinto:
+transformar geométricamente el cerebro de cada paciente para que todos tengan el mismo 
+tamaño, forma y orientación, de modo que puedas comparar la misma región anatómica entre pacientes.
+Por qué es necesario: cada persona tiene un cerebro de forma y tamaño ligeramente distinto. 
+Si quieres comparar "¿hay más atrofia en el hipocampo del paciente A vs. el paciente B?",
+primero necesitas que el "hipocampo" esté en la misma posición de coordenadas en ambas imágenes —
+si no, estás comparando manzanas con peras.
+El proceso, conceptualmente:
+
+Tomas la imagen del paciente (en su espacio nativo, único para él)
+La deformas (rígida y luego no linealmente, "warping") hasta que se ajuste a una plantilla común de referencia
+Esa plantilla se llama atlas o template
+
+Atlas cerebral
+Un atlas es, esencialmente, un cerebro de referencia (o un promedio de muchos cerebros) 
+con las regiones anatómicas ya delimitadas y etiquetadas. 
+Una vez que la imagen de tu paciente está "normalizada" (alineada) a ese atlas, puedes:
+
+Saber automáticamente qué vóxel (píxel 3D) pertenece a qué región 
+(hipocampo, tálamo, sustancia blanca periventricular...)
+Comparar volúmenes región por región entre pacientes, 
+porque todos están en el mismo sistema de coordenadas
+
+Los atlas más comunes que te vas a encontrar:
+
+MNI152 (Montreal Neurological Institute) — el estándar de facto en casi todo el campo,
+es al que normaliza FreeSurfer, FSL, SPM por defecto
+Talairach — más antiguo, histórico, cada vez menos usado pero aparece en papers antiguos
+Atlas específicos de lesiones/sustancia blanca (ej. JHU white matter atlas) 
+— útil si te interesa no solo "cuánta lesión hay" sino "en qué tracto de sustancia blanca está esa lesión", lo cual puede tener relevancia clínica distinta según la localización
+
+Cómo esto conecta con lo que ya sabes hacer
+Una vez que una imagen está normalizada espacialmente y tienes el atlas superpuesto, 
+el software (FreeSurfer, FSL, nnU-Net) puede automáticamente decirte "hay 3.2 mL 
+de lesión en la sustancia blanca periventricular" o "el volumen del hipocampo izquierdo es X mL,
+que corresponde al percentil Y comparado con población sana de referencia normalizada por edad". 
+Esos números son exactamente las columnas de tu radiology_data.csv.
+Es decir: todo este proceso —secuencias, normalización espacial, atlas— 
+ocurre antes de que tú toques nada en R. Tu trabajo empieza cuando ya tienes esos números tabulares. 
+Pero entender este proceso te permite:
+
+Saber qué preguntar cuando recibas datos radiológicos ("¿está normalizado por TIV?",
+"¿qué atlas se usó?", "¿es T2 o FLAIR el que dio ese volumen de lesión?")
+Detectar cuando algo está mal (ej. si un pipeline de segmentación fallo 
+por mala normalización espacial, vas a ver outliers rarísimos en tus volúmenes)
+Hablar con el radiólogo/técnico de imagen del equipo en su mismo idioma
+
+Un concepto adicional que te va a aparecer mucho: registro (registration)
+Es el proceso técnico que hace la normalización espacial posible —
+el algoritmo que calcula la transformación geométrica (rotación, escalado, deformación) 
+necesaria para alinear una imagen a otra. Hay dos tipos:
+
+Registro rígido/afín: solo rotación, traslación, escalado uniforme —
+corrige diferencias de posición/tamaño global de la cabeza
+Registro no lineal (warping): deforma localmente para que estructuras específicas
+(surcos, giros) coincidan mejor entre cerebros de forma distinta — 
+más potente pero más costoso computacionalmente y más propenso a errores si la imagen tiene mala calidad
+
+Esto es relevante también para el "batch effect" que mencionamos con ComBat: 
+parte de la variabilidad entre centros/escáneres viene precisamente de que el
+registro a veces funciona mejor o peor según la calidad/resolución de la imagen
+original de cada máquina.
