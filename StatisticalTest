@@ -1,0 +1,226 @@
+Herramientas estadísticas en este tipo de estudios
+
+Todo lo que hemos visto (ML, integración multiómica) necesita un andamiaje estadístico "clásico" por debajo, 
+tanto para justificar decisiones metodológicas como para el rigor que exige publicar en un journal clínico. 
+Te lo organizo por función dentro del pipeline.
+
+
+Resumen:                                    dónde encaja cada herramienta en el flujo del proyecto
+Fase del proyecto	                          Herramienta estadística
+Diseño / tamaño muestral	                  Power analysis (pwr, powerSurvEpi)
+Descripción de cohorte	                    Tabla 1, tests de comparación (tableone)
+Screening de biomarcadores	                Tests univariados + corrección múltiple (BH/Bonferroni)
+Datos faltantes	                            Imputación múltiple (mice)
+Datos longitudinales	                      Modelos mixtos (lme4)
+Supervivencia con eventos competidores	    Fine-Gray / cmprsk
+Validación de modelo predictivo            	C-index, ROC dependiente del tiempo, calibración, NRI/IDI
+Robustez de estimaciones	                  Bootstrap de intervalos de confianza
+
+En la práctica, 
+machine learning (para integrar y predecir), 
+estadística inferencial clásica (para validar y cuantificar incertidumbre con rigor), 
+y buenas prácticas de reproducibilidad (para que el hallazgo sobreviva a revisión por pares y replicación externa). 
+Ningún paper serio de biomarcadores se sostiene solo con la parte de ML — 
+la validación estadística es lo que lo hace publicable.
+
+##############################################################################################
+1. Estadística descriptiva y comparación de grupos basales
+
+####+++++++++++++++++++++++++++++++++++++++++++++++++++++++++##
+Verificación de normalidad (para decidir t-test vs. Mann-Whitney):
+
+r
+shapiro.test(datos_cox$edad)  # H0: los datos son normales
+# n > 50: mejor mirar el histograma/QQ-plot que confiar ciegamente en Shapiro
+
+Antes de cualquier modelo, todo paper reporta una Tabla 1: características demográficas y clínicas por grupo (ej. por subtipo, o por progresores/no progresores).
+
+
+#####+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++#####
+Aquí decides el test según el tipo de variable:
+
+Tipo de variable	           Test (2 grupos)	                                  Test (3+ grupos)
+Continua, normal	           t-test	                                            ANOVA
+Continua, no normal	         Mann-Whitney U (Wilcoxon)	                        Kruskal-Wallis
+Categórica	                 Chi-cuadrado / Fisher exacto (n pequeño)	          Chi-cuadrado
+
+r
+library(tableone)
+
+variables <- c("edad", "edss_basal", "sexo", "tipo_ms", "tiempo_evolucion_an")
+tabla1 <- CreateTableOne(vars = variables, strata = "subtipo", data = datos_cox, 
+                          test = TRUE, addOverall = TRUE)
+print(tabla1, nonnormal = c("edss_basal"))  # especifica variables no normales
+
+#####+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++#####
+
+############################################################################
+
+2. Corrección por comparaciones múltiples
+
+Este es uno de los puntos donde más se falla en estudios con muchas variables (genéticas, inmunológicas). 
+Si comparas 50 biomarcadores entre progresores/no progresores, 
+esperas ~2-3 "significativos" solo por azar (con α = 0.05).
+
+r
+p_valores <- sapply(biomarcadores, function(var) {
+  wilcox.test(datos[[var]] ~ datos$progresion)$p.value
+})
+
+# Bonferroni: muy conservador, controla error familia-wise
+p_bonferroni <- p.adjust(p_valores, method = "bonferroni")
+
+# Benjamini-Hochberg (FDR): más habitual en ómica, controla tasa de falsos positivos
+p_fdr <- p.adjust(p_valores, method = "BH")
+
+Cuál usar: 
+
+- Bonferroni si el coste de un falso positivo es muy alto 
+(ej. vas a iniciar un tratamiento basado en ese hallazgo); 
+
+- BH/FDR es el estándar en estudios ómicos exploratorios porque 
+Bonferroni es demasiado estricto cuando pruebas miles de variables (perderías señales reales).
+
+############################################################################
+
+3. Análisis de potencia (power analysis) — antes de recoger/analizar datos
+
+Crítico para justificar el tamaño de cohorte necesario, 
+y para interpretar honestamente un resultado no significativo 
+(¿no hay efecto, o simplemente no tenías potencia para detectarlo?).
+
+r
+library(pwr)
+
+# ¿Cuántos pacientes necesito para detectar un tamaño de efecto medio (d=0.5)
+# entre dos grupos, con potencia 80%?
+pwr.t.test(d = 0.5, power = 0.8, sig.level = 0.05, type = "two.sample")
+
+# Para supervivencia (Cox), la librería específica:
+library(powerSurvEpi)
+powerCT.default(nE = 80, nC = 120, pE = 0.4, pC = 0.25, RR = 1.8, alpha = 0.05)
+
+En tu contexto: si el proyecto involucra decidir cuántos pacientes reclutar para detectar diferencias 
+en progresión entre subtipos, esto se calcula antes, no se justifica después de ver los datos 
+(eso sería post-hoc power, generalmente mal visto metodológicamente).
+
+############################################################################
+
+4. Manejo formal de datos faltantes
+
+Ya vimos imputación simple (mediana) en el script, pero para un análisis serio 
+hay que ser más riguroso, especialmente si el missing no es completamente aleatorio 
+(ej. a los pacientes más graves no siempre les da tiempo a hacerse todas las pruebas).
+
+Clasificación del missing (determina qué método es válido):
+
+MCAR (completamente al azar): cualquier método funciona
+MAR (al azar condicionado a otras variables observadas): imputación múltiple es válida
+MNAR (no al azar, depende del valor faltante mismo): ningún método estándar lo resuelve bien, requiere modelado explícito
+
+
+r
+library(mice)
+
+# Imputación múltiple (genera varios datasets completados, no uno solo)
+imputacion <- mice(datos, m = 5, method = "pmm", seed = 123)
+
+# Ajustar el modelo en cada dataset imputado y combinar resultados (reglas de Rubin)
+modelos <- with(imputacion, coxph(Surv(tiempo, evento) ~ edad + biomarcador))
+resultado_combinado <- pool(modelos)
+summary(resultado_combinado)
+
+Esto es más defendible que imputar con la mediana y tratar el dato como si fuera real, 
+porque propaga la incertidumbre de la imputación al resultado final (intervalos de confianza más honestos).
+
+############################################################################
+
+5. Modelos mixtos para datos longitudinales
+
+Si tienes medidas repetidas por paciente (EDSS cada 6 meses, RM seriadas), 
+no puedes tratar cada visita como una observación independiente (violarías el supuesto de independencia). 
+Aquí entran los modelos lineales/no lineales mixtos.
+
+r
+library(lme4)
+library(lmerTest)  # añade p-valores, que lme4 omite por defecto
+
+# Efecto fijo: tiempo y subtipo; efecto aleatorio: intercepto y pendiente por paciente
+modelo_mixto <- lmer(edss ~ tiempo_visita * subtipo + edad + (1 + tiempo_visita | patient_id),
+                      data = datos_longitudinales)
+summary(modelo_mixto)
+
+Esto te permite preguntar: "¿la trayectoria de deterioro (pendiente en el tiempo) difiere entre subtipos?", 
+que es una pregunta más rica que solo comparar tiempo-hasta-un-evento binario.
+
+############################################################################
+6. Modelos de riesgos competitivos (extensión de Cox)
+
+Mencionado antes brevemente, pero vale la pena detenerse: en EM, un paciente puede "salir" 
+del estudio por varias razones que compiten entre sí (progresión de discapacidad, 
+pero también cambio de tratamiento, pérdida de seguimiento, muerte por otra causa). 
+Cox estándar trata todo lo que no es tu evento de interés como censura simple, 
+lo cual puede sesgar las estimaciones si esas causas competidoras no son independientes del evento de interés.
+
+r
+library(cmprsk)
+
+# evento: 0 = censurado, 1 = progresión, 2 = cambio de tratamiento por otra causa
+modelo_competitivo <- cuminc(ftime = datos$tiempo, fstatus = datos$evento_multi, 
+                              group = datos$subtipo)
+plot(modelo_competitivo)
+
+# Regresión de Fine-Gray (equivalente a Cox pero para riesgo acumulado competitivo)
+library(riskRegression)
+modelo_fg <- FGR(Hist(tiempo, evento_multi) ~ subtipo + edad, data = datos, cause = 1)
+
+############################################################################
+
+7. Estadística para validar biomarcadores/modelos predictivos
+
+Más allá del C-index que ya vimos, hay herramientas específicas para evaluar si un modelo predictivo es clínicamente útil:
+
+Curvas ROC dependientes del tiempo (para supervivencia, el AUC clásico no aplica directamente):
+
+r
+library(timeROC)
+
+roc_tiempo <- timeROC(T = datos$tiempo, delta = datos$evento,
+                       marker = datos$factor_mofa_1,  # tu predictor continuo
+                       cause = 1, times = c(12, 24, 36),  # AUC a 1, 2 y 3 años
+                       iid = TRUE)
+plot(roc_tiempo, time = 24)
+
+Calibración (¿las probabilidades predichas coinciden con las observadas?, no solo discriminación):
+
+r
+library(rms)
+modelo_val <- cph(Surv(tiempo, evento) ~ subtipo + edad, data = datos_cox, x = TRUE, y = TRUE, surv = TRUE)
+val <- validate(modelo_val, method = "boot", B = 200)  # optimismo corregido por bootstrap
+calibrate(modelo_val, B = 200)
+
+Net Reclassification Improvement (NRI) / Integrated Discrimination Improvement (IDI): 
+cuantifican cuánto mejora la clasificación de riesgo al añadir tu biomarcador 
+multiómico a un modelo clínico ya existente — 
+muy usado cuando el argumento del paper es "esto añade valor sobre lo que ya se usa en la clínica".
+
+############################################################################
+
+8. Reproducibilidad estadística — el punto que conecta con "parámetros reproducibles" de la oferta
+Fijar semillas (set.seed()) en cualquier paso con aleatoriedad (bootstrap, CV, inicialización de clustering) — ya lo hemos hecho en el script
+Reportar intervalos de confianza vía bootstrap en vez de solo point estimates, especialmente con n pequeño:
+r
+library(boot)
+
+estadistico_hr <- function(datos, indices) {
+  d <- datos[indices, ]
+  modelo <- coxph(Surv(tiempo, evento) ~ subtipo, data = d)
+  exp(coef(modelo))
+}
+resultado_boot <- boot(datos_cox, estadistico_hr, R = 1000)
+boot.ci(resultado_boot, type = "bca")  # IC bootstrap más robusto que el normal
+Control de calidad estadístico de los datos genéticos: equilibrio de Hardy-Weinberg, 
+control de estratificación poblacional (relevante si tu cohorte no es genéticamente homogénea) — 
+con paquetes como SNPassoc o genetics
+
+############################################################################
