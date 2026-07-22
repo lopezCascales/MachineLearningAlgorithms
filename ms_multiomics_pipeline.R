@@ -1,6 +1,6 @@
 #############################################################################
 # PIPELINE DE INTEGRACIÓN MULTIÓMICA - PROGRESIÓN EN ESCLEROSIS MÚLTIPLE
-#
+# Maria Teresa Lopez Cascales
 # Este script:
 #   1. SIMULA 5 archivos de input (clínico, genético, inmunológico,
 #      radiológico y de supervivencia) con una estructura realista,
@@ -385,3 +385,5 @@ cat("\n>>> Pipeline completo. Resultados guardados en ./resultados/\n")
 cat("    - kaplan_meier_subtipos.pdf\n")
 cat("    - importancia_variables_rsf.pdf\n")
 cat("    - subtipos_pacientes.csv\n")
+
+##########################################################################################################
