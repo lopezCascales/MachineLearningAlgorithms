@@ -54,3 +54,601 @@ En estudios de EM, casi siempre vas a tener: n pequeño (decenas-cientos de paci
 Modelos regularizados: Lasso, Ridge, Elastic Net (seleccionan variables automáticamente y evitan overfitting) — en R, paquete glmnet
 Validación cruzada rigurosa (nested CV si además haces selección de hiperparámetros)
 Preferir modelos más simples e interpretables sobre deep learning, salvo que tengas una cohorte grande
+
+#######################################################################################################################################
+#######################################################################################################################################
+DECISSION TABLE 
+
+SVM vs Random Forest vs regresión logística/Cox: tabla de decisión
+Escenario	Mejor opción
+
+Necesitas interpretabilidad clínica (HR, OR) para publicar	                      Logística / Cox
+p >> n (muchas variables ómicas, pocos pacientes), buscas rendimiento predictivo	SVM o Random Forest
+Necesitas importancia de variables + robustez sin mucho tuning	                  Random Forest
+Datos radiológicos crudos (imágenes, no features tabulares)	                      Deep learning (CNN)
+Quieres combinar todo y comparar objetivamente	                                  Los tres, dentro del mismo pipeline de CV, comparando métricas
+
+
+Tabla resumen de todo el bloque de aprendizaje supervisado
+Método                                                 Mejor para en tu proyecto	                          Interpretabilidad	          Requisito de datos
+Logística / Cox	                                       Modelo predictivo final, publicable	                Alta (OR/HR)	              Bajo-moderado
+Cox regularizado (Lasso/Elastic Net)	                 Selección de biomarcadores con p>>n	                Alta	                      Bajo-moderado
+Random Forest / RSF	                                   Exploración inicial, importancia de variables	      Media	                      Moderado
+XGBoost	                                               Rendimiento predictivo puro, pipeline maduro	        Media-baja	                Moderado
+SVM	                                                   p>>n, clasificación con margen claro	                Baja (con kernel no lineal)	Moderado
+Deep Learning (CNN)	                                   Extracción de features de imagen RM cruda	          Baja	                      Alto (o transfer learning)
+
+#######################################################################################################################################
+#######################################################################################################################################
+1. Modelos lineales/interpretables
+
+###===========================================#######
+Regresión logística
+
+Qué modela: la probabilidad de que ocurra un evento binario (progresa / no progresa) en función de tus predictores.
+
+$$\log\left(\frac{p}{1-p}\right) = \beta_0 + \beta_1 x_1 + \beta_2 x_2 + \dots + ... +\beta_n x_n$$
+
+Donde 
+𝑝  es la probabilidad del evento, y cada 𝛽  es el efecto de esa variable (edad, un biomarcador inmunológico, una variante genética, un volumen de lesión en RM, etc.) sobre el log-odds del evento.
+
+Por qué es interpretable: cada coeficiente 𝛽𝑖 , al exponenciarlo (𝑒𝛽𝑖), te da un odds ratio (OR). 
+Por ejemplo, si para un biomarcador inmunológico el OR = 2.3, significa que por cada unidad de aumento en ese biomarcador, 
+las probabilidades (odds) de progresión se multiplican por 2.3, manteniendo el resto constante. 
+Esto es exactamente el lenguaje que usan los clínicos y lo que se reporta en papers.
+
+Limitación importante para tu caso: la regresión logística no usa la información de "cuándo" ocurre el evento, solo si ocurrió o no en un punto fijo de tiempo. Si tienes pacientes con distinto tiempo de seguimiento (algunos llevan 2 años, otros 10), estás perdiendo información y sesgando resultados. Aquí es donde entra Cox.
+
+En R:
+
+r
+modelo <- glm(progresion ~ edad + biomarcador_inmuno + variante_genetica + volumen_lesion,
+              data = pacientes, family = binomial)
+summary(modelo)
+exp(coef(modelo))  # para obtener los odds ratios
+exp(confint(modelo))  # intervalos de confianza de los OR
+
+###===========================================#######
+Regresión de Cox (modelo de riesgos proporcionales)
+
+Qué modela: no la probabilidad de que el evento ocurra, sino el riesgo instantáneo (hazard) de que ocurra en cada momento, dado que no ha ocurrido todavía. Esto es clave en EM porque:
+
+No todos los pacientes tienen el mismo tiempo de seguimiento
+Hay pacientes censurados (el estudio termina o el paciente abandona antes de progresar — no sabes si habría progresado después, pero sabes que no progresó hasta ese punto)
+Si un biomarcador tiene HR = 1.8, significa que por cada unidad de aumento, el riesgo instantáneo de progresar es 1.8 veces mayor en cualquier momento del tiempo, manteniendo el resto constante.
+
+Supuesto clave a verificar: proporcionalidad de riesgos (que el efecto de cada variable sea constante en el tiempo). Se comprueba con residuos de Schoenfeld — si lo violas, tus HR pueden no ser válidos.
+
+En R:
+
+r
+library(survival)
+
+# tiempo = tiempo hasta progresión o hasta censura
+# evento = 1 si progresó, 0 si censurado
+modelo_cox <- coxph(Surv(tiempo, evento) ~ edad + biomarcador_inmuno + 
+                     variante_genetica + volumen_lesion, data = pacientes)
+summary(modelo_cox)
+
+# comprobar el supuesto de riesgos proporcionales
+cox.zph(modelo_cox)
+
+# visualizar curvas de supervivencia
+library(survminer)
+ggsurvplot(survfit(modelo_cox), data = pacientes)
+
+###===========================================#######
+Cuándo usar cada uno en tu contexto de EM
+Situación	Modelo
+Predecir si un paciente progresará en un plazo fijo (ej. a 2 años, todos con mismo seguimiento)	Logística
+Tiempo hasta conversión a EM progresiva, con seguimientos de duración variable y pacientes censurados	Cox
+Múltiples eventos posibles compitiendo (ej. progresión vs. cambio de tratamiento por otra causa)	Cox con riesgos competitivos (cmprsk o finegray en R)
+
+
+El problema del n pequeño / p grande otra vez
+
+Con datos genéticos e inmunológicos multidimensionales, vas a tener muchas más variables candidatas que pacientes. 
+Ni glm() ni coxph() "puros" funcionan bien ahí (overfitting, coeficientes inestables o que ni siquiera convergen). 
+La solución estándar es la versión regularizada:
+
+r
+library(glmnet)
+
+# Cox con penalización Lasso (selecciona variables automáticamente)
+x <- model.matrix(~ . , data = predictores)[,-1]
+y <- Surv(pacientes$tiempo, pacientes$evento)
+modelo_cox_lasso <- cv.glmnet(x, y, family = "cox", alpha = 1)
+coef(modelo_cox_lasso, s = "lambda.min")
+####################################################################################################################################
+#######################################################################################################################################
+2. Basados en árboles (ensemble methods)
+
+La idea base: el árbol de decisión
+
+Un árbol único divide los pacientes recursivamente en función de las variables, buscando en cada paso el corte que mejor separa a los pacientes según el resultado (ej. "¿biomarcador X > 5?" → sí/no → siguiente corte...). Es muy interpretable pero inestable: pequeños cambios en los datos pueden dar árboles muy distintos, y tiende a sobreajustar. Por eso casi nunca se usa solo; se usa en conjuntos (ensembles).
+
+###===========================================#######
+Random Forest
+
+Idea: construir cientos de árboles, cada uno entrenado con:
+
+Una muestra bootstrap distinta de los pacientes (muestreo con reemplazo)
+Un subconjunto aleatorio de variables en cada división
+
+Luego se promedian las predicciones (regresión) o se vota (clasificación). Esto reduce mucho la varianza/overfitting de un árbol individual.
+
+Por qué te sirve en EM:
+
+Maneja de forma nativa variables de distinto tipo y escala (genéticas categóricas, inmunológicas continuas, clínicas ordinales) sin necesidad de normalizar
+Captura interacciones no lineales automáticamente (ej. que un biomarcador solo importe combinado con cierta variante genética) sin que tengas que especificarlas
+Da una medida de importancia de variables, útil para generar hipótesis sobre qué combinación de datos multidimensionales pesa más en la progresión
+Funciona razonablemente bien incluso con n moderado
+
+Limitación real para tu caso: no maneja censura de forma nativa (el Random Forest "clásico" es para clasificación/regresión, no supervivencia). Para eso existe una variante:
+
+Random Survival Forest — la versión pensada para datos de tiempo-a-evento con censura, ideal si quieres combinar el enfoque de Cox con la flexibilidad no lineal de árboles.
+
+r
+library(randomForestSRC)
+
+modelo_rsf <- rfsrc(Surv(tiempo, evento) ~ edad + biomarcador_inmuno +
+                     variante_genetica + volumen_lesion,
+                     data = pacientes, ntree = 1000, importance = TRUE)
+
+# importancia de variables
+vimp(modelo_rsf)
+plot(modelo_rsf)
+
+###===========================================#######
+Para clasificación/regresión estándar:
+
+r
+library(randomForest)  # o ranger, más rápido para datasets grandes
+
+modelo_rf <- randomForest(as.factor(progresion) ~ edad + biomarcador_inmuno +
+                           variante_genetica + volumen_lesion,
+                           data = pacientes, ntree = 1000, importance = TRUE)
+
+importance(modelo_rf)
+varImpPlot(modelo_rf)
+
+###===========================================#######
+Gradient Boosting (XGBoost / LightGBM)
+
+Idea distinta a Random Forest: en lugar de construir árboles independientes en paralelo y promediar, construye árboles secuencialmente, donde cada árbol nuevo corrige los errores del conjunto anterior. Suele dar mejor rendimiento predictivo puro que Random Forest, pero:
+
+Es más sensible a overfitting si no se regula bien (requiere tuning cuidadoso de hiperparámetros: profundidad del árbol, tasa de aprendizaje, número de árboles)
+Necesita más cuidado con la validación cruzada, especialmente con n pequeño
+
+En R:
+
+r
+library(xgboost)
+
+x <- as.matrix(predictores)  # solo variables predictoras, numéricas
+y <- pacientes$progresion    # 0/1
+
+dtrain <- xgb.DMatrix(data = x, label = y)
+
+modelo_xgb <- xgboost(data = dtrain, max_depth = 3, eta = 0.1,
+                       nrounds = 100, objective = "binary:logistic",
+                       eval_metric = "auc")
+
+xgb.importance(model = modelo_xgb)
+
+Para supervivencia, XGBoost también soporta objective = "survival:cox".
+
+
+###===========================================#######
+
+Random Forest vs Gradient Boosting: cuándo elegir cuál
+Aspecto	                                  Random Forest        	                                        Gradient Boosting
+Facilidad de uso	                        Muy pocos hiperparámetros, difícil de "romper"	              Requiere tuning cuidadoso
+Riesgo de overfitting con n pequeño	      Menor	                                                        Mayor si no se regula bien
+Rendimiento predictivo puro	              Bueno	                                                        Suele ser mejor si está bien ajustado
+Punto de partida recomendado	            Sí, para explorar y generar hipótesis	                        Cuando ya tienes un pipeline maduro y quieres exprimir rendimiento
+
+Dado que trabajarás con cohortes clínicas (probablemente n pequeño-moderado) 
+y necesitas resultados robustos y reproducibles, 
+Random Forest / Random Survival Forest suele ser el punto de entrada más seguro, 
+y luego XGBoost como comparación una vez tengas el pipeline de validación bien establecido.
+
+
+###===========================================#######
+Un punto crítico que no puedes saltarte: la importancia de variables no es gratis
+
+Con Random Forest, la importancia por defecto (basada en decrecimiento de impureza) está sesgada hacia variables continuas o con muchas categorías (típico en datos genéticos con muchos SNPs). 
+
+Para tu tipo de datos, conviene usar:
+
+Importancia por permutación (importance = TRUE en randomForest, o ranger(importance = "permutation")) — más fiable
+Para Random Survival Forest, vimp() en randomForestSRC ya usa un enfoque más robusto
+
+r
+library(ranger)
+
+modelo_ranger <- ranger(as.factor(progresion) ~ ., data = pacientes,
+                         importance = "permutation", num.trees = 1000)
+sort(modelo_ranger$variable.importance, decreasing = TRUE)
+
+###===========================================#######
+CROSS VALIDATION 
+Validación: el punto que más se rompe en la práctica
+
+Con n pequeño y muchas variables (típico en EM con datos ómicos), es fácil que el modelo memorice el ruido. 
+
+Necesitas obligatoriamente:
+
+Validación cruzada (k-fold, o mejor, repetida) para estimar el rendimiento real
+
+Si además ajustas hiperparámetros (ej. en XGBoost), validación cruzada anidada (nested CV) para no inflar artificialmente el rendimiento
+
+El problema que hay que resolver: fuga de información (data leakage)
+
+Antes del código, el concepto que más se rompe en la práctica: 
+todo el preprocesamiento (normalización, imputación, selección de variables) debe aprenderse SOLO con los datos de entrenamiento de cada fold, 
+nunca con el dataset completo antes de dividir. 
+Si normalizas con la media/SD de todo el dataset y luego haces CV (Cross Validation),
+ya filtraste información del test al entrenamiento — esto infla el rendimiento artificialmente y es un error muy común en papers de biomarcadores.
+
+
+###### Opción 1: tidymodels (recomendado)
+
+Estructura: recipe (preprocesamiento) → model spec → workflow (junta ambos) → resamples (folds) → tune/fit_resamples.
+
+r
+library(tidymodels)
+library(censored)  # extensión de tidymodels para supervivencia (Cox, RSF)
+
+# 1. Split inicial: separar un test set que NO tocas hasta el final
+set.seed(123)
+split_inicial <- initial_split(pacientes, prop = 0.8, strata = progresion)
+train_data <- training(split_inicial)
+test_data  <- testing(split_inicial)
+
+# 2. Definir el preprocesamiento (recipe) — aquí especificas TODO
+#    lo que se debe aprender solo de los datos de entrenamiento
+receta <- recipe(progresion ~ ., data = train_data) %>%
+  step_impute_median(all_numeric_predictors()) %>%   # imputación
+  step_normalize(all_numeric_predictors()) %>%        # escalado
+  step_nzv(all_predictors()) %>%                       # elimina variables casi constantes
+  step_corr(all_numeric_predictors(), threshold = 0.9) # elimina colinealidad extrema
+
+# 3. Definir el modelo (aquí, Random Forest; luego ves cómo cambiarlo)
+modelo_rf <- rand_forest(mtry = tune(), trees = 1000, min_n = tune()) %>%
+  set_engine("ranger", importance = "permutation") %>%
+  set_mode("classification")
+
+# 4. Workflow: junta receta + modelo
+wf <- workflow() %>%
+  add_recipe(receta) %>%
+  add_model(modelo_rf)
+
+# 5. Validación cruzada (folds SOLO sobre train_data)
+set.seed(123)
+folds <- vfold_cv(train_data, v = 5, repeats = 3, strata = progresion)
+
+# 6. Grid de hiperparámetros a probar
+grid_rf <- grid_regular(
+  mtry(range = c(2, 8)),
+  min_n(range = c(2, 10)),
+  levels = 5
+)
+
+# 7. Tuning con CV
+set.seed(123)
+resultados <- tune_grid(
+  wf,
+  resamples = folds,
+  grid = grid_rf,
+  metrics = metric_set(roc_auc, accuracy, sens, spec)
+)
+
+# 8. Ver los mejores hiperparámetros
+show_best(resultados, metric = "roc_auc")
+mejor_modelo <- select_best(resultados, metric = "roc_auc")
+
+# 9. Finalizar el workflow con los mejores hiperparámetros
+wf_final <- finalize_workflow(wf, mejor_modelo)
+
+# 10. Ajustar sobre TODO train_data y evaluar UNA VEZ en test_data
+ajuste_final <- last_fit(wf_final, split_inicial, 
+                          metrics = metric_set(roc_auc, accuracy, sens, spec))
+
+collect_metrics(ajuste_final)   # rendimiento real, no inflado
+collect_predictions(ajuste_final)
+
+# Puntos clave de este pipeline:
+
+# initial_split con strata = mantiene la proporción de la variable objetivo en train/test (crítico si tienes clases desbalanceadas, típico en progresión de EM)
+# El test_data se toca una sola vez, al final, con last_fit() — nunca antes
+# tune_grid() hace CV correctamente: en cada fold, la receta (normalización, imputación) se re-aprende solo con los datos de entrenamiento de ese fold, evitando el data leakage
+
+Para supervivencia (Cox / Random Survival Forest) con censored
+r
+library(censored)
+
+modelo_cox <- proportional_hazards(penalty = tune()) %>%
+  set_engine("glmnet") %>%
+  set_mode("censored regression")
+
+wf_surv <- workflow() %>%
+  add_recipe(receta) %>%  # ajustar la fórmula a Surv(tiempo, evento) ~ .
+  add_model(modelo_cox)
+
+# métricas específicas de supervivencia
+resultados_surv <- tune_grid(
+  wf_surv,
+  resamples = folds,
+  metrics = metric_set(concordance_survival)  # índice C
+)
+
+
+###### Opción 2: caret (si tu grupo ya lo usa y quieres consistencia)
+r
+library(caret)
+
+set.seed(123)
+particion <- createDataPartition(pacientes$progresion, p = 0.8, list = FALSE)
+train_data <- pacientes[particion, ]
+test_data  <- pacientes[-particion, ]
+
+# Control de la validación cruzada
+control <- trainControl(
+  method = "repeatedcv", number = 5, repeats = 3,
+  classProbs = TRUE, summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+# Preprocesamiento dentro del propio train() para evitar leakage
+modelo <- train(
+  progresion ~ ., data = train_data,
+  method = "ranger",
+  trControl = control,
+  preProcess = c("medianImpute", "center", "scale", "nzv"),
+  metric = "ROC",
+  tuneLength = 5
+)
+
+modelo$bestTune
+confusionMatrix(predict(modelo, test_data), test_data$progresion)
+
+###### Nested CV: cuándo es realmente necesario
+
+Lo que acabas de ver (train/test split + CV para tuning) es válido para la mayoría de casos. 
+Pero si tu n es muy pequeño (cohortes de EM de, digamos, <150 pacientes), 
+un solo test set puede darte una estimación muy inestable del rendimiento real, 
+porque depende de qué pacientes cayeron ahí por azar. 
+Ahí conviene nested CV: un bucle externo de CV para evaluar, y dentro de cada fold externo, otro bucle interno de CV para tuning.
+
+r
+# Con tidymodels: nested_cv()
+folds_externos <- nested_cv(pacientes, 
+                             outside = vfold_cv(v = 5, strata = progresion),
+                             inside  = vfold_cv(v = 5, strata = progresion))
+
+# Es más costoso computacionalmente pero da una estimación mucho más honesta del rendimiento esperado en datos nuevos
+# — importante si el objetivo final es publicar un biomarcador o modelo predictivo.
+
+Recomendación práctica para tu caso concreto
+
+Dado que vas a integrar datos multidimensionales (genéticos + inmunológicos + clínicos + radiológicos) probablemente con n moderado:
+
+Empieza con tidymodels + vfold_cv repetido (5x3 o 10x3) — buen balance entre robustez y coste computacional
+Usa step_*() en la receta para TODO el preprocesamiento, nunca fuera del pipeline
+Si el n es pequeño (<150-200), considera nested CV para el reporte final de rendimiento
+Para supervivencia, usa censored + índice de concordancia (C-index) como métrica principal, no accuracy
+
+
+#############################################################################################################################
+#############################################################################################################################
+
+3. Support Vector Machines (SVM)
+
+La idea central
+
+SVM busca el hiperplano que mejor separa las clases, maximizando el margen 
+(la distancia entre el hiperplano y los puntos más cercanos de cada clase, llamados vectores de soporte). 
+A diferencia de la regresión logística, que ajusta una función de probabilidad, 
+SVM se preocupa principalmente por encontrar el límite de decisión óptimo.
+
+El "truco" que lo hace potente: el kernel trick. 
+Si los datos no son separables linealmente (lo normal en biología), 
+SVM puede proyectarlos a un espacio de mayor dimensión donde sí lo sean, 
+sin calcular explícitamente esa transformación. Los kernels más usados:
+
+Lineal: cuando esperas relaciones aditivas simples entre variables
+RBF (radial basis function): el más usado por defecto, captura relaciones no lineales complejas
+Polinomial: para interacciones de cierto orden entre variables
+Por qué es relevante para tu caso (datos ómicos)
+
+SVM tiene una propiedad histórica importante: funciona bien cuando el número de variables (p) 
+es mucho mayor que el número de observaciones (n) — 
+el escenario clásico "p >> n" de datos genéticos/transcriptómicos. 
+
+Por eso fue (y sigue siendo) muy popular en:
+
+Clasificación de perfiles de expresión génica
+Clasificación de imágenes de RM en EM (distinguir patrones de lesión, predecir subtipos)
+Clasificación con paneles de biomarcadores inmunológicos de alta dimensión
+
+Limitaciones importantes que debes conocer
+Poco interpretable con kernels no lineales: con kernel RBF o polinomial, no obtienes coeficientes tipo odds ratio o hazard ratio. 
+Pierdes la interpretabilidad clínica que sí tienes con regresión logística/Cox. 
+Con kernel lineal sí recuperas cierta interpretabilidad (los pesos indican importancia relativa).
+Sensible al escalado: es obligatorio normalizar las variables antes de usar SVM (a diferencia de Random Forest, que es indiferente a la escala). 
+Si no lo haces, una variable con rango grande (ej. un valor de laboratorio en miles) dominará artificialmente sobre otra en escala pequeña (ej. una proporción 0-1).
+No maneja supervivencia de forma nativa: existen extensiones (SVM para supervivencia, ej. survivalsvm en R) pero son menos estándar y menos usadas que Cox o Random Survival Forest.
+Escala mal con muchas observaciones: para n grande (miles de pacientes) se vuelve computacionalmente costoso; no es tu problema típico en cohortes clínicas de EM, pero conviene saberlo.
+Requiere tuning cuidadoso: el hiperparámetro de coste (C, cuánto penalizar errores de clasificación) y el parámetro del kernel (ej. gamma en RBF) afectan mucho el resultado y necesitan búsqueda vía CV.
+
+###===========================================#######
+En R, con tidymodels (siguiendo el pipeline que ya montamos)
+r
+library(tidymodels)
+
+# Especificación del modelo SVM con kernel radial
+modelo_svm <- svm_rbf(cost = tune(), rbf_sigma = tune()) %>%
+  set_engine("kernlab") %>%
+  set_mode("classification")
+
+wf_svm <- workflow() %>%
+  add_recipe(receta) %>%   # la misma receta con normalize() es OBLIGATORIA aquí
+  add_model(modelo_svm)
+
+grid_svm <- grid_regular(
+  cost(range = c(-5, 5)),        # en escala log2
+  rbf_sigma(range = c(-5, 0)),   # en escala log10
+  levels = 5
+)
+
+resultados_svm <- tune_grid(
+  wf_svm,
+  resamples = folds,
+  grid = grid_svm,
+  metrics = metric_set(roc_auc, accuracy, sens, spec)
+)
+
+show_best(resultados_svm, metric = "roc_auc")
+
+Con caret:
+
+r
+modelo_svm <- train(
+  progresion ~ ., data = train_data,
+  method = "svmRadial",
+  trControl = control,
+  preProcess = c("center", "scale"),  # obligatorio para SVM
+  metric = "ROC",
+  tuneLength = 5
+)
+###===========================================#######
+Un matiz práctico importante
+
+En la práctica actual de investigación biomédica, 
+SVM ha perdido protagonismo frente a Random Forest/XGBoost, 
+porque estos últimos dan importancia de variables de forma más natural 
+(algo que en tu proyecto es clave, ya que quieres identificar qué combinación de datos multidimensionales predice progresión, no solo predecir bien). 
+
+SVM sigue siendo útil como comparación o cuando tienes evidencia previa de que las clases 
+son separables con un margen claro, pero probablemente no sea tu primera herramienta.
+
+#############################################################################################################################
+#############################################################################################################################
+
+4. Redes neuronales / Deep Learning
+
+Por qué merece un tratamiento aparte
+
+Los métodos anteriores (Cox, Random Forest, SVM) trabajan con variables ya extraídas 
+(features tabulares: un valor de biomarcador, un volumen de lesión calculado, un genotipo). 
+El deep learning es distinto: puede aprender directamente de datos crudos de alta dimensión 
+—una imagen de RM completa, una secuencia genómica, una serie temporal de datos clínicos— 
+sin que tú definas manualmente qué características extraer. 
+Esto es su gran ventaja y también su mayor exigencia de datos.
+
+La pregunta que debes hacerte primero: ¿tienes suficientes datos?
+
+Esta es la limitación más real en tu contexto. 
+Deep learning típicamente necesita miles-decenas de miles de ejemplos para superar a métodos más simples. 
+Las cohortes clínicas de EM con datos multidimensionales completos (genético + inmunológico + clínico + radiológico) suelen ser de decenas a cientos de pacientes. Con ese tamaño:
+
+Una red neuronal profunda entrenada desde cero probablemente sobreajustará y funcionará peor que Random Forest o Cox regularizado
+Tiene sentido en componentes específicos donde sí hay volumen (ej. miles de cortes/slices de RM de un número menor de pacientes) o usando transfer learning
+Dónde el deep learning sí aporta valor en tu proyecto
+
+1. Datos radiológicos (el caso más claro)
+
+CNNs (redes convolucionales) para trabajar directamente con imágenes de RM: 
+segmentación automática de lesiones, cálculo de volumetría cerebral/lesional, detección de atrofia
+No necesitas entrenar desde cero: existen modelos preentrenados en neuroimagen 
+(ej. arquitecturas tipo U-Net para segmentación de lesiones de EM) que puedes ajustar (fine-tuning) con tu cohorte, incluso siendo relativamente pequeña
+Esto te daría las "features" (volúmenes, número de lesiones, localización) que luego alimentan 
+a Cox/Random Forest para el modelo predictivo final — es decir, DL como preprocesamiento, no necesariamente como modelo predictivo final
+
+2. Datos genómicos/transcriptómicos de alta dimensión
+
+Autoencoders para reducción de dimensionalidad no lineal (alternativa a PCA cuando las relaciones no son lineales), 
+útiles para encontrar representaciones latentes de perfiles inmunológicos o de expresión génica antes de integrarlos con otras capas de datos
+
+3. Datos longitudinales/secuenciales
+
+Si tienes seguimiento repetido en el tiempo (EDSS medido cada 6 meses, RM seriadas),
+arquitecturas tipo RNN/LSTM o modelos más modernos (Transformers) pueden modelar la trayectoria temporal, 
+algo que Cox estándar no captura bien (Cox asume habitualmente un único conjunto de covariables, 
+aunque existen extensiones de Cox con covariables dependientes del tiempo)
+
+4. Integración multimodal end-to-end
+
+Arquitecturas que combinan distintas "ramas" de red (una CNN para imagen, una red densa para datos tabulares clínicos/genéticos) 
+que se fusionan en capas finales — esto conecta directamente con el objetivo del puesto, pero requiere volumen de datos considerable para no sobreajustar
+
+###===========================================#######
+
+El problema práctico en R
+
+Aquí tengo que ser honesto: el ecosistema de deep learning en R (keras, torch para R) funciona, pero la comunidad, documentación, tutoriales y modelos preentrenados en imagen médica están mayoritariamente en Python (PyTorch, TensorFlow/Keras, MONAI —este último específico para imagen médica—). Dado que mencionas que eventualmente trabajarás en Python, este es probablemente el componente del puesto donde más lo vas a necesitar.
+
+En R (viable para redes más simples, ej. sobre datos tabulares):
+
+r
+library(torch)
+
+# Ejemplo de una red simple para datos tabulares (no imagen)
+net <- nn_module(
+  initialize = function(input_size) {
+    self$fc1 <- nn_linear(input_size, 32)
+    self$fc2 <- nn_linear(32, 16)
+    self$fc3 <- nn_linear(16, 1)
+  },
+  forward = function(x) {
+    x %>%
+      self$fc1() %>% nnf_relu() %>%
+      self$fc2() %>% nnf_relu() %>%
+      self$fc3() %>% nnf_sigmoid()
+  }
+)
+
+modelo <- net(input_size = ncol(x_train))
+optimizador <- optim_adam(modelo$parameters, lr = 0.001)
+
+###===========================================#######
+
+En Python (el estándar real para imagen médica, ej. con MONAI para segmentación de lesiones de EM):
+
+python
+import monai
+from monai.networks.nets import UNet
+
+modelo = UNet(
+    spatial_dims=3,
+    in_channels=1,
+    out_channels=2,  # ej. lesión vs no-lesión
+    channels=(16, 32, 64, 128, 256),
+    strides=(2, 2, 2, 2),
+)
+
+###===========================================#######
+Cómo encaja esto en el pipeline completo (importante)
+
+Para tu proyecto, el enfoque más realista no es "deep learning para todo", sino:
+
+DL como extractor de features en la capa radiológica (CNN/U-Net sobre imágenes → volúmenes de lesión, atrofia, localización)
+Esas features salen como variables tabulares
+Se integran con las variables genéticas, inmunológicas y clínicas (también tabulares)
+El modelo predictivo final sobre ese conjunto integrado usa métodos más robustos con n pequeño: 
+Cox regularizado, 
+Random Forest, 
+o los métodos de integración multiómica (MOFA2, SNF) que mencionamos al principio
+
+Es decir: deep learning resuelve el problema de "convertir imágenes crudas en números útiles"; 
+los métodos anteriores resuelven "predecir progresión a partir de esos números". 
+Rara vez conviene meter todo en una única red end-to-end con cohortes de este tamaño.
+
+#############################################################################################################################
+#############################################################################################################################
+
+5. Multiomic Integration
+
+
+
