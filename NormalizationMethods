@@ -1,0 +1,149 @@
+Métodos de normalización
+
+Este es un paso que parece trivial pero determina si tu integración multiómica 
+va a funcionar bien o va a estar dominada por artefactos técnicos. 
+Cada capa de datos (genética, inmunológica, clínica, radiológica) 
+tiene su propia fuente de ruido técnico y su propio método de normalización estándar —
+mezclar esto mal es una de las causas más comunes de resultados espurios en estudios multiómicos.
+
+Por qué importa tanto aquí específicamenteCuando integras con SNF o MOFA2, 
+el algoritmo mide "distancia" o "covarianza" entre pacientes. 
+Si una capa tiene escalas absurdamente distintas entre variables 
+(ej. NfL en pg/mL con rango 0-500 vs. un ratio CD4/CD8 con rango 0-5), 
+esa variable de rango grande dominará artificialmente la señal, 
+no porque sea biológicamente más importante, sino por la escala en la que se midió. 
+La normalización corrige esto — pero cada tipo de dato necesita un método distinto.
+
+###++++++++++++++++++++++++++++++++++++++++++++++++++++++++####
+1. Normalización de datos clínicos/inmunológicos 
+(variables continuas "estándar")Z-score (estandarización) — 
+la más común, y la que ya usamos en el script:
+
+$$z = \frac{x - \bar{x}}{s}$$
+
+Centra en media 0 y desviación estándar 1. 
+Apropiada cuando la distribución es razonablemente simétrica.
+
+rdatos_z <- scale(datos_numericos)
+
+Problema real con biomarcadores inmunológicos: 
+casi nunca son normales — 
+suelen tener colas largas a la derecha 
+(ej. IL-6, NfL, CXCL13 típicamente siguen algo parecido a log-normal). 
+Normalizar con z-score sobre datos sesgados sigue dejando outliers con influencia desproporcionada.
+
+Solución: transformación logarítmica antes del z-score
+rdatos$NfL_log <- log1p(datos$NfL_pg_ml)  # log(1+x), maneja bien valores cercanos a 0
+datos$NfL_z   <- scale(datos$NfL_log)
+
+Normalización robusta (mediana/MAD) — cuando hay outliers extremos
+Menos sensible a valores atípicos que la media/SD clásica — 
+recomendable en biomarcadores clínicos donde un solo paciente con un valor extremo puede distorsionar la escala de toda la variable.
+
+rrobusto <- function(x) (x - median(x, na.rm = TRUE)) / mad(x, na.rm = TRUE)
+datos$IL6_robusto <- robusto(datos$IL6_pg_ml)
+###++++++++++++++++++++++++++++++++++++++++++++++++++++++++####
+2. Normalización de datos genéticos
+Aquí la normalización cambia de naturaleza según qué tengas:
+
+Dosis alélica (0/1/2, como en el ejemplo del script): 
+normalmente NO se transforma de la misma forma que variables continuas. 
+Se puede dejar como está (es una escala ordinal con significado biológico directo) 
+o centrarla, pero z-score puro no siempre es apropiado porque 
+la varianza de un SNP depende de su frecuencia alélica (MAF).
+
+Normalización específica para genotipos (usada en PCA de estructura poblacional, ej. SNPRelate, EIGENSTRAT):
+donde p es la frecuencia alélica del SNP. 
+Esto evita que SNPs raros (baja frecuencia) tengan varianza artificialmente distinta a SNPs comunes.
+
+rnormalizar_snp <- function(genotipos) {
+  p <- mean(genotipos, na.rm = TRUE) / 2  # frecuencia alélica
+  (genotipos - 2 * p) / sqrt(2 * p * (1 - p) + 1e-8)
+}
+
+Si trabajas con datos de expresión génica (RNA-seq) en vez de SNPs, 
+ahí la normalización es otro mundo completamente distinto:
+
+CPM/TPM (counts/transcripts per million) — 
+corrige por profundidad de secuenciación
+
+TMM (trimmed mean of M-values, en edgeR) 
+o median-of-ratios (en DESeq2) — 
+corrigen por composición de la librería, más robustos que CPM simple
+
+library(DESeq2)
+dds <- DESeqDataSetFromMatrix(countData = matriz_conteos, colData = metadata, design = ~ subtipo)
+dds <- estimateSizeFactors(dds)
+conteos_normalizados <- counts(dds, normalized = TRUE)
+vst_datos <- vst(dds)  # variance-stabilizing transformation, buena para clustering/PCA posterior
+
+###++++++++++++++++++++++++++++++++++++++++++++++++++++++++####
+3. Normalización de datos radiológicos/imagen
+
+Aquí el problema no es solo de escala, sino de variabilidad entre escáneres/protocolos (site effects) — 
+muy relevante si tu cohorte viene de varios centros/máquinas de RM.
+
+Normalización de intensidad de imagen (antes de extraer features):
+
+Z-score dentro del cerebro (usando solo tejido cerebral como referencia, no fondo)
+White-stripe normalization: normaliza usando la sustancia blanca de apariencia normal
+como referencia — muy usado en pipelines de EM porque la sustancia blanca es el tejido de interés
+
+Histogram matching: ajusta el histograma de intensidades de cada imagen a una referencia común
+
+Normalización de volúmenes/features ya extraídas (lo más relevante para tu pipeline, 
+ya que trabajas con features tabulares tipo "volumen de lesión"):
+
+Corrección por volumen craneal total (TIV): los volúmenes cerebrales absolutos 
+varían por tamaño de cabeza/sexo, no por patología — 
+hay que normalizar por TIV antes de comparar entre pacientes
+
+rdatos$volumen_cerebral_ajustado <- datos$volumen_cerebral_ml / datos$volumen_craneal_total_ml
+
+ComBat / ComBat-GAM: el método estándar en neuroimagen multi-sitio para corregir 
+"batch effects" de escáner sin eliminar la señal biológica real (muy usado en consorcios grandes de neuroimagen, ej. ENIGMA)
+
+rlibrary(neuroCombat)
+datos_corregidos <- neuroCombat(dat = t(matriz_features), batch = datos$centro_escaner,
+                                 mod = model.matrix(~ edad + sexo, data = datos))$dat.combat
+Esto es importante mencionarlo en la entrevista si tu cohorte es multicéntrica: 
+sin corrección de batch effect, el modelo puede aprender a distinguir "centro de escaneo" 
+en vez de "patología" — un error muy común y difícil de detectar sin revisarlo explícitamente.
+
+###++++++++++++++++++++++++++++++++++++++++++++++++++++++++####
+
+4. Normalización específica dentro de MOFA2/SNF
+MOFA2: internamente asume que especificas la distribución correcta por vista 
+(gaussian para continuas normalizadas, bernoulli para binarias, poisson para conteos) — 
+la normalización previa (log-transform, etc.) sigue siendo tu responsabilidad antes de pasarle los datos, 
+MOFA2 no la hace por ti salvo centrar/escalar internamente de forma básica.
+SNF: la documentación recomienda explícitamente standardNormalization() (z-score estándar) 
+antes de calcular las matrices de distancia —
+es lo que ya usamos en el script (scale()), 
+pero conviene aplicar antes las transformaciones log/robustas 
+específicas de cada capa que hemos visto arriba, y DESPUÉS el z-score de SNF.
+
+####################################################################
+
+El orden correcto de operaciones (importante)
+
+1. Normalización específica de cada capa 
+(log-transform inmuno, VST genética, ComBat radiología) — c
+orrige el ruido técnico propio de esa tecnología
+2. Imputación de missing (si aplica), sobre los datos ya normalizados
+3. Z-score final (estandarización cruzada entre capas) —
+solo al final, justo antes de la integración (SNF/MOFA2), 
+para que todas las vistas entren en escalas comparables
+4. Nunca normalices usando estadísticos (media, SD, frecuencia alélica)
+calculados sobre train+test juntos — 
+mismo problema de data leakage que vimos con la validación cruzada; 
+la normalización debe re-ajustarse dentro de cada fold si estás validando un pipeline predictivo completo
+
+Tabla resumen: qué usar según el tipo de dato
+Capa de datos                         Problema típico                          Método recomendado
+Clínico (edad, EDSS)                  Escalas heterogéneas                     Z-score estándar
+Inmunológico (biomarcadores)          Distribución sesgada (cola derecha)      log1p() + z-score, o normalización robusta (mediana/MAD)
+Genético (SNPs, dosis alélica)        Varianza depende de frecuencia alélica   Normalización específica por MAF, o dejar como dosis cruda
+Genético (RNA-seq, expresión)         Profundidad de secuenciación variable    TMM / median-of-ratios (DESeq2) + VST
+Radiológico (intensidad de imagen)    Variabilidad entre escáneres             White-stripe / histogram matching (antes de extraer features)
+Radiológico (volúmenes ya extraídos)  Tamaño craneal, batch de escáner/centro  Corrección por TIV + ComBat
