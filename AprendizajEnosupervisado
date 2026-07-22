@@ -1,0 +1,257 @@
+Aquí no hay una variable objetivo que predecir. 
+No le dices al algoritmo "esto es progresión, esto no". 
+En vez de eso, le das los datos (genéticos, inmunológicos, clínicos, radiológicos) 
+y le pides que encuentre estructura: 
+      grupos de pacientes similares, 
+      patrones ocultos, 
+      dimensiones latentes que resuman la variabilidad. 
+Es especialmente valioso en tu proyecto porque en EM la progresión probablemente no es un fenómeno homogéneo — 
+puede haber subtipos de pacientes con trayectorias distintas que aún no están bien caracterizados clínicamente, 
+y esto es exactamente lo que el aprendizaje no supervisado puede ayudar a descubrir.
+
+########################################################################################################################
+1. Clustering (encontrar subgrupos de pacientes)
+
+####+++++++++++++++++++++++++++++++++++++++++++++++####
+K-means
+
+Divide a los pacientes en k grupos, minimizando la distancia de cada paciente al centro de su grupo
+Requiere que definas k de antemano (se suele estimar con el método del codo o el estadístico de silueta)
+Asume clusters de forma esférica y tamaño similar — una limitación real si tus subgrupos de pacientes no tienen esa forma
+Requiere variables numéricas y escaladas
+r
+library(cluster)
+library(factoextra)
+
+datos_escalados <- scale(datos_pacientes[, variables_numericas])
+
+# Determinar el número óptimo de clusters
+fviz_nbclust(datos_escalados, kmeans, method = "silhouette")
+
+set.seed(123)
+modelo_kmeans <- kmeans(datos_escalados, centers = 3, nstart = 25)
+fviz_cluster(modelo_kmeans, data = datos_escalados)
+
+####+++++++++++++++++++++++++++++++++++++++++++++++####
+Clustering jerárquico
+
+No necesitas fijar k de antemano; construye un dendrograma que puedes "cortar" al nivel que quieras
+Útil para explorar visualmente cómo se agrupan los pacientes y a qué distancia
+Computacionalmente más costoso con muchos pacientes, pero manejable en cohortes clínicas típicas
+r
+distancias <- dist(datos_escalados, method = "euclidean")
+modelo_hc <- hclust(distancias, method = "ward.D2")
+plot(modelo_hc)
+rect.hclust(modelo_hc, k = 3, border = "red")
+
+grupos <- cutree(modelo_hc, k = 3)
+
+####+++++++++++++++++++++++++++++++++++++++++++++++####
+Clustering basado en densidad (DBSCAN)
+
+No asume forma esférica de los clusters, y además identifica automáticamente "outliers" (pacientes atípicos que no encajan bien en ningún grupo) en lugar de forzarlos a un cluster
+Útil si sospechas que hay pacientes con perfiles claramente atípicos (ej. formas raras de EM)
+
+Un matiz importante para datos clínicos mixtos: si combinas variables numéricas (biomarcadores) con categóricas (sexo, presencia/ausencia de mutación), K-means estándar no es apropiado. Ahí se usa:
+
+Gower distance + clustering jerárquico o PAM (k-medoids), que manejan tipos de variable mixtos
+r
+library(cluster)
+
+# distancia de Gower para datos mixtos (numéricos + categóricos)
+gower_dist <- daisy(datos_pacientes, metric = "gower")
+modelo_pam <- pam(gower_dist, k = 3, diss = TRUE)
+
+
+########################################################################################################################
+
+2. Reducción de dimensionalidad
+
+Esencial cuando tienes cientos/miles de variables (típico en datos genéticos e inmunológicos) y necesitas visualizar o simplificar antes de cualquier otro análisis.
+
+####+++++++++++++++++++++++++++++++++++++++++++++++####
+PCA (Análisis de Componentes Principales)
+
+Encuentra combinaciones lineales de las variables originales (componentes) que capturan la mayor varianza posible
+Ventaja: interpretable — puedes ver qué variables originales "cargan" más en cada componente
+Limitación: solo captura relaciones lineales
+
+r
+library(FactoMineR)
+library(factoextra)
+
+pca_resultado <- PCA(datos_escalados, graph = FALSE)
+
+fviz_pca_ind(pca_resultado, col.ind = "cos2")  # pacientes en el espacio de componentes
+fviz_pca_var(pca_resultado)                     # qué variables contribuyen a cada componente
+fviz_eig(pca_resultado)                          # varianza explicada por componente
+
+####+++++++++++++++++++++++++++++++++++++++++++++++####
+UMAP / t-SNE
+
+Técnicas no lineales, mucho mejores para visualizar estructura compleja en datos de alta dimensión 
+(muy usadas en genómica de célula única, pero aplicables a cualquier dato ómico)
+UMAP generalmente preferido sobre t-SNE hoy en día: preserva mejor tanto estructura local como global,
+y es más rápido
+Importante: las distancias entre clusters en un gráfico de UMAP/t-SNE no son directamente 
+interpretables cuantitativamente (a diferencia de PCA) — son para visualización 
+y generación de hipótesis, no para conclusiones cuantitativas finales
+
+
+r
+library(umap)
+
+resultado_umap <- umap(datos_escalados)
+plot(resultado_umap$layout, col = grupos_clinicos, pch = 19)
+
+####+++++++++++++++++++++++++++++++++++++++++++++++####
+3. Factor Analysis / NMF (para datos ómicos con estructura latente)
+Similar en espíritu a PCA pero pensado para encontrar factores latentes interpretables biológicamente 
+(ej. una "firma inmunológica" compuesta por varios biomarcadores correlacionados)
+
+NMF (Non-negative Matrix Factorization):
+útil cuando tus datos son no-negativos por naturaleza 
+(ej. niveles de expresión génica, conteos), 
+porque da factores más fácilmente interpretables como "programas biológicos activos"
+Cómo encaja esto con el resto del proyecto (conexión práctica)
+
+El flujo típico en un proyecto como el tuyo sería:
+
+Reducción de dimensionalidad (PCA/UMAP) sobre cada capa de datos (genética, inmunología) para explorar y visualizar
+Clustering sobre esa representación reducida (o directamente sobre los datos) para identificar subtipos de pacientes (ej. "cluster inmunológico A" vs "cluster B")
+Esos clusters se convierten en una nueva variable categórica
+Se valida clínicamente: ¿los pacientes del cluster A progresan más rápido que los del B? 
+(aquí vuelves a supervisado: Cox comparando clusters, o simplemente log-rank test)
+
+Esto es exactamente el tipo de hallazgo que se publica como "identificamos un endotipo inmunológico asociado a progresión temprana" — muy valioso para el objetivo del puesto.
+
+####+++++++++++++++++++++++++++++++++++++++++++++++####
+Validación del clustering (el paso que mucha gente se salta)
+
+Un clustering siempre te va a dar grupos, aunque no exista estructura real. Necesitas verificar que los clusters son:
+
+Estables: ¿se reproducen con bootstrap o remuestreo? (clValid, fpc::clusterboot)
+
+Clínicamente significativos: ¿difieren en variables externas no usadas para clusterizar (edad, EDSS, tiempo de evolución)?
+
+r
+library(fpc)
+
+resultado_estabilidad <- clusterboot(datos_escalados, B = 100, 
+                                       clustermethod = kmeansCBI, k = 3)
+resultado_estabilidad$bootmean  # cercano a 1 = cluster estable
+
+
+Cualquier algoritmo de clustering te va a devolver grupos, 
+incluso si aplicas K-means sobre ruido puro sin estructura real. 
+El algoritmo no tiene forma de decirte "en realidad aquí no hay grupos" — 
+simplemente particiona lo que le des. Así que la pregunta no es "¿tengo clusters?" (siempre los vas a tener), 
+sino "¿son estos clusters una característica real y estable de mis datos, 
+o son un artefacto de la muestra concreta que usé?"
+
+La idea del bootstrap aplicado a clustering
+
+Tomas tu dataset original de pacientes y generas muchas "versiones perturbadas" de él —
+remuestreando pacientes con reemplazo (bootstrap clásico) o eliminando aleatoriamente un subconjunto de variables o pacientes—. 
+En cada versión perturbada, vuelves a correr el clustering. 
+
+Luego comparas: ¿los mismos pacientes siguen agrupándose juntos, cluster tras cluster, a pesar de la perturbación?
+
+Si un cluster es real (refleja una estructura biológica genuina, ej. un subtipo inmunológico), 
+debería reaparecer de forma consistente aunque cambies ligeramente qué pacientes o qué muestra usas. 
+Si un cluster es artefacto del azar, se desintegrará o cambiará de composición cada vez que perturbas los datos.
+
+Cómo se mide concretamente: el índice de Jaccard
+
+clusterboot() (que usa el método de Christian Hennig) hace esto:
+
+Genera B réplicas bootstrap del dataset (remuestreo con reemplazo, mismo tamaño que el original)
+Aplica tu algoritmo de clustering (K-means, jerárquico, PAM, lo que hayas usado) a cada réplica
+Para cada cluster original, calcula el índice de Jaccard con el cluster más parecido en cada réplica bootstrap. El índice de Jaccard mide la superposición entre dos grupos:
+
+$$J = \frac{|A \cap B|}{|A \cup B|}$$
+
+Va de 0 (ningún paciente en común) a 1 (exactamente los mismos pacientes)
+
+Promedia esos valores de Jaccard a lo largo de las B réplicas → eso es bootmean
+
+Cómo interpretar los valores (regla práctica de Hennig)
+Jaccard promedio	    Interpretación
+< 0.5	                Cluster inestable/disuelto — no lo reportes como hallazgo
+0.5 – 0.6	            Patrón débil, tómalo con mucha cautela
+0.6 – 0.75	          Cluster razonablemente estable
+> 0.75-0.85	          Cluster muy estable, patrón robusto
+
+Esto es clave para tu proyecto: 
+si vas a decir "identificamos un endotipo inmunológico asociado a progresión temprana", 
+necesitas poder mostrar que ese cluster tiene, 
+digamos, Jaccard > 0.7-0.8, 
+no un cluster que aparece por casualidad con esa muestra concreta de pacientes.
+
+Ejemplo completo en R
+r
+library(fpc)
+
+set.seed(123)
+resultado_estabilidad <- clusterboot(
+  datos_escalados,
+  B = 100,                    # número de réplicas bootstrap
+  clustermethod = kmeansCBI,  # el algoritmo que quieres validar
+  k = 3,                      # mismo k que usaste originalmente
+  seed = 123
+)
+
+resultado_estabilidad$bootmean   # Jaccard promedio por cluster
+resultado_estabilidad$bootbrd    # número de veces que el cluster se "disolvió"
+resultado_estabilidad$bootrecover # número de veces que el cluster se recuperó bien
+
+Para clustering jerárquico:
+
+r
+resultado_hc <- clusterboot(
+  datos_escalados,
+  B = 100,
+  clustermethod = hclustCBI,
+  k = 3,
+  method = "ward.D2"
+)
+
+Una alternativa/complemento: subsampling en lugar de bootstrap
+
+En vez de remuestrear con reemplazo (bootstrap clásico), otra estrategia habitual —especialmente popular en genómica (ej. el paquete ConsensusClusterPlus, muy usado en subtipado molecular de cáncer y aplicable aquí)— es:
+
+Tomar repetidamente subconjuntos aleatorios del 80-90% de los pacientes (sin reemplazo)
+Clusterizar cada subconjunto
+Construir una matriz de consenso: para cada par de pacientes, ¿en qué proporción de las repeticiones cayeron en el mismo cluster?
+Pacientes que consistentemente caen juntos (consenso alto) forman un cluster robusto; pacientes con consenso ambiguo indican una zona de frontera poco fiable
+r
+library(ConsensusClusterPlus)
+
+resultado_consenso <- ConsensusClusterPlus(
+  t(datos_escalados),  # ojo: espera variables en filas, pacientes en columnas
+  maxK = 6,
+  reps = 100,
+  pItem = 0.8,   # 80% de pacientes en cada repetición
+  pFeature = 1,
+  clusterAlg = "km",
+  distance = "euclidean",
+  seed = 123
+)
+
+Esto además te ayuda a decidir el número óptimo de clusters (k), 
+mirando en qué k la matriz de consenso es más "limpia" (bloques bien definidos, poco solapamiento) — 
+un problema que K-means/jerárquico no resuelven por sí solos.
+
+Por qué esto importa especialmente en tu contexto
+
+Con datos multidimensionales de EM (genética + inmunología + clínica + radiología),
+el riesgo de encontrar clusters espurios es alto por dos razones:
+
+n moderado: con pocas decenas/cientos de pacientes, 
+un cluster puede estar definido por 5-6 pacientes atípicos, no por una estructura real
+p alto: con muchas variables (especialmente genéticas), 
+es fácil encontrar alguna combinación que separe a los pacientes en grupos, por puro azar (la famosa "maldición de la dimensionalidad")
+
+Por eso, en papers de subtipado (muy común en oncología y cada vez más en enfermedades autoinmunes/neurológicas), 
+la validación de estabilidad vía bootstrap/consenso ya casi se considera un requisito, no un extra opcional, 
+antes de afirmar que un subgrupo es clínicamente relevante.
