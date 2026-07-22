@@ -1,0 +1,56 @@
+Perfecto, vamos por partes. El aprendizaje supervisado es probablemente lo primero que usarías en este puesto, 
+porque en EM sueles tener una variable objetivo clara: 
+  progresión de discapacidad (EDSS), 
+  conversión a EM secundaria progresiva, 
+  respuesta a tratamiento, 
+  aparición de nuevas lesiones, etc.
+
+¿Qué lo define?
+
+Necesitas datos etiquetados: 
+  para cada paciente, 
+  además de las variables predictoras (genéticas, inmunológicas, clínicas, radiológicas), 
+  tienes un resultado conocido (lo que pasó o lo que quieres predecir). 
+  El algoritmo aprende la relación entre predictores y resultado.
+
+Dos tipos de problema, según qué quieras predecir:
+
+Clasificación — resultado categórico (ej. "progresa" vs "no progresa", "responde al tratamiento" vs "no responde")
+Regresión — resultado continuo (ej. score EDSS futuro, volumen de lesión)
+Supervivencia/tiempo-a-evento — cuándo ocurre algo, con censura (ej. tiempo hasta conversión a EM progresiva) — este es especialmente relevante en EM porque muchos pacientes aún no han tenido el evento cuando termina el seguimiento
+
+Los algoritmos más relevantes para tu caso
+
+1. Modelos lineales/interpretables
+
+Regresión logística (clasificación binaria) LR
+Regresión de Cox (supervivencia) — el estándar de facto en investigación clínica de EM para analizar tiempo hasta progresión
+Ventaja: coeficientes interpretables, importante para publicar y para que clínicos confíen en el modelo
+
+En R: glm(), paquete survival (coxph())
+
+2. Basados en árboles (ensemble methods)
+
+Random Forest, Gradient Boosting (XGBoost, LightGBM)
+Ventaja: manejan bien datos tabulares heterogéneos (mezclar variables genéticas, inmunológicas y clínicas de distinta escala), capturan interacciones no lineales, dan medidas de importancia de variables
+Muy usados cuando tienes muchas variables candidatas y pocas observaciones (típico en cohortes clínicas)
+
+En R: randomForest, ranger (más rápido), xgboost
+
+3. Support Vector Machines (SVM)
+
+Buenos cuando el número de variables es alto respecto al número de pacientes (común con datos ómicos)
+Muy usados históricamente en clasificación de imágenes de RM en EM
+
+4. Redes neuronales / Deep Learning
+
+Solo si tienes volumen de datos suficiente (esto es una limitación real en cohortes clínicas de EM, que suelen ser de cientos, no millones)
+CNNs para datos radiológicos crudos (no features extraídas, sino imágenes directas)
+Puede tener sentido para el componente radiológico, no tanto para clínico/genético con n pequeño
+Un problema práctico que te vas a encontrar
+
+En estudios de EM, casi siempre vas a tener: n pequeño (decenas-cientos de pacientes) y p grande (muchas variables genéticas/inmunológicas). Esto favorece:
+
+Modelos regularizados: Lasso, Ridge, Elastic Net (seleccionan variables automáticamente y evitan overfitting) — en R, paquete glmnet
+Validación cruzada rigurosa (nested CV si además haces selección de hiperparámetros)
+Preferir modelos más simples e interpretables sobre deep learning, salvo que tengas una cohorte grande
