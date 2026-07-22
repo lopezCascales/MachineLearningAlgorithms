@@ -1,0 +1,475 @@
+Integración multiómica
+
+Este es el núcleo real del puesto: no se trata de analizar genética, inmunología, clínica y radiología por separado, 
+sino de encontrar la estructura conjunta que emerge cuando las combinas. Vamos a fondo.
+
+El problema conceptual que resuelve
+
+Si analizas cada capa de datos por separado (un PCA de genética, un PCA de inmunología, un modelo de Cox con clínica), 
+puedes perderte señales que solo aparecen en la combinación. Un ejemplo típico en EM: una variante genética por sí sola no predice nada, 
+un perfil inmunológico por sí solo tampoco, pero la combinación de ambos sí define un subgrupo con progresión rápida. 
+La integración multiómica busca exactamente ese tipo de estructura compartida y complementaria entre capas ("vistas" o views, en la jerga).
+
+#####################################################################################################
+Las tres estrategias de integración (marco conceptual)
+
+Antes de entrar en algoritmos concretos, hay que ubicar dónde ocurre la integración:
+
+####+++++++++++++++++++++++++++++++++++++++++++++++++####
+Integración temprana (early integration)
+Concatenas todas las variables de todas las capas en una única matriz gigante 
+(genética + inmunología + clínica + radiología, todo junto)
+y aplicas un método estándar (PCA, Random Forest, etc.) sobre esa matriz combinada.
+
+Ventaja: simple
+Problema serio: las capas tienen escalas, distribuciones y dimensionalidades muy distintas 
+(miles de SNPs vs. 10 variables clínicas), 
+así que la capa con más variables domina artificialmente el análisis. 
+Rara vez es la mejor opción, pero sirve como baseline.
+
+####+++++++++++++++++++++++++++++++++++++++++++++++++####
+Integración tardía (late integration)
+Analizas cada capa por separado (un modelo predictivo por capa) 
+y luego combinas las predicciones finales (ej. votación, promedio, un modelo de segundo nivel/stacking).
+
+Ventaja: cada capa se modela con el método más apropiado para ella
+Problema: no captura interacciones entre capas, solo combina resultados finales
+
+####+++++++++++++++++++++++++++++++++++++++++++++++++####
+Integración intermedia (intermediate integration) — la más potente y donde están MOFA2 y SNF
+Los datos de todas las capas se combinan durante el proceso de modelado, no antes ni después, 
+permitiendo que el algoritmo aprenda relaciones cruzadas entre capas mientras respeta 
+que cada una tiene su propia estructura y escala. 
+Es el estándar actual en investigación multiómica seria.
+
+
+Tabla comparativa para decidir
+Método	                                Tipo de output	                  Maneja datos faltantes	           Mejor para
+MOFA2	                                  Factores latentes continuos	      Muy bien	                         Encontrar dimensiones integradas interpretables, luego usarlas en Cox/RF
+SNF	                                    Red de similitud → clusters	      Limitado	                         Subtipado/clustering de pacientes multiómico
+DIABLO	                                Componentes discriminantes	      Moderado	                         Cuando ya tienes el outcome y quieres integración supervisada
+iCluster(Bayes)	                        Clusters + factores	              Limitado	                         Alternativa bayesiana a MOFA2, muy usada en oncología
+Early integration	                      Matriz concatenada	              Depende del método downstream	     Baseline simple, raramente la mejor opción final
+
+#####################################################################################################
+
+MOFA2 (Multi-Omics Factor Analysis)
+La idea
+
+MOFA2 es conceptualmente una extensión de PCA/factor analysis a múltiples matrices de datos simultáneamente. 
+En vez de buscar componentes que expliquen varianza en una sola matriz, busca factores latentes compartidos que 
+expliquen varianza a través de todas las capas (genética, inmunología, clínica, radiología), 
+permitiendo además que algunos factores sean específicos de una sola capa.
+
+Por qué es especialmente apropiado para tu caso
+Maneja datos faltantes de forma nativa: si un paciente tiene datos radiológicos pero le falta el panel inmunológico completo, 
+MOFA2 no lo descarta — usa la información disponible. Esto es crítico en cohortes clínicas reales, 
+donde casi nunca tienes las 4 capas completas para todos los pacientes.
+Cada vista puede tener su propia distribución (gaussiana para datos continuos como biomarcadores, 
+Bernoulli para datos binarios como presencia/ausencia de mutación, Poisson para conteos)
+Los factores resultantes son interpretables: puedes ver qué variables de qué capas cargan en cada factor, 
+y preguntar "¿el factor 3 correlaciona con progresión?"
+Distingue factores compartidos (varianza que aparece en varias capas — la señal biológica realmente integrada) 
+de factores específicos de una vista (varianza propia de, por ejemplo, solo la genética) — esto es información valiosa por sí misma
+
+
+Pipeline completo en R
+r
+library(MOFA2)
+
+# 1. Preparar los datos: una lista de matrices, una por vista
+#    Cada matriz: variables en filas, pacientes en columnas
+#    Los nombres de columna (pacientes) deben coincidir entre vistas,
+#    pero NO es necesario que todos los pacientes estén en todas las vistas
+
+datos_mofa <- list(
+  genetica     = t(matriz_genetica),      # SNPs/variantes x pacientes
+  inmunologia  = t(matriz_inmuno),        # biomarcadores x pacientes
+  clinica      = t(matriz_clinica),       # variables clínicas x pacientes
+  radiologia   = t(matriz_radiomica)      # features de imagen x pacientes
+)
+
+# 2. Crear el objeto MOFA
+mofa_objeto <- create_mofa(datos_mofa)
+
+# Visualizar la estructura de datos disponible por paciente/vista
+plot_data_overview(mofa_objeto)
+
+# 3. Definir opciones del modelo
+opciones_datos <- get_default_data_options(mofa_objeto)
+
+opciones_modelo <- get_default_model_options(mofa_objeto)
+opciones_modelo$num_factors <- 10   # número máximo de factores a estimar
+
+opciones_entrenamiento <- get_default_training_options(mofa_objeto)
+opciones_entrenamiento$seed <- 123
+opciones_entrenamiento$convergence_mode <- "fast"  # o "slow" para mayor precisión
+
+# 4. Preparar y entrenar el modelo (usa Python/reticulate por debajo)
+mofa_objeto <- prepare_mofa(
+  mofa_objeto,
+  data_options = opciones_datos,
+  model_options = opciones_modelo,
+  training_options = opciones_entrenamiento
+)
+
+modelo_mofa <- run_mofa(mofa_objeto, outfile = "modelo_ms_mofa.hdf5")
+
+# 5. Explorar varianza explicada por cada factor, en cada vista
+plot_variance_explained(modelo_mofa, x = "view", y = "factor")
+
+# ¿Qué factores son compartidos entre varias capas vs específicos de una?
+# (factores con varianza alta en múltiples vistas = señal integrada real)
+
+# 6. Correlacionar factores con variables clínicas de interés
+correlate_factors_with_covariates(
+  modelo_mofa,
+  covariates = c("edad", "EDSS_basal", "progresion", "tiempo_evolucion"),
+  plot = "r"
+)
+
+# 7. Ver qué variables cargan más en un factor de interés (ej. Factor 2)
+plot_weights(modelo_mofa, view = "inmunologia", factor = 2, nfeatures = 15)
+plot_top_weights(modelo_mofa, view = "genetica", factor = 2, nfeatures = 15)
+
+# 8. Extraer los factores para usarlos como input de un modelo predictivo posterior
+factores <- get_factors(modelo_mofa, factors = "all")$group1
+
+# Estos factores (dimensión reducida, integrando las 4 capas) se pueden
+# usar directamente como predictores en Cox, Random Forest, etc.
+
+Lo que obtienes al final
+
+Un conjunto reducido de factores (típicamente 5-15) que resumen la variación conjunta de las 4 capas. 
+El paso natural siguiente es tomar esos factores y meterlos en el pipeline de supervivencia/clasificación que ya montamos:
+
+r
+library(survival)
+
+datos_supervivencia <- data.frame(factores, tiempo = pacientes$tiempo, evento = pacientes$evento)
+
+modelo_cox_mofa <- coxph(Surv(tiempo, evento) ~ ., data = datos_supervivencia)
+summary(modelo_cox_mofa)
+
+Esto te permite decir algo del tipo: "el Factor 3, que combina un perfil inmunológico específico 
+con patrones de conectividad en RM, se asocia significativamente con tiempo hasta progresión (HR = X, p = Y)" — 
+exactamente el tipo de hallazgo integrado que busca este puesto.
+
+#####################################################################################################
+
+Similarity Network Fusion (SNF)
+La idea (muy distinta a MOFA2)
+
+En vez de buscar factores latentes, SNF construye una red de similitud entre pacientes para cada capa de datos por separado, 
+y luego fusiona esas redes en una única red de similitud integrada, iterativamente, dejando que cada capa refuerce o corrija a las demás.
+
+Pasos conceptuales:
+
+Para cada vista (genética, inmunología, clínica, radiología), construyes una matriz de similitud paciente-a-paciente (ej. distancia euclidiana o de correlación entre perfiles)
+Conviertes cada matriz de similitud en una red de k-vecinos más cercanos (cada paciente conectado a sus vecinos más parecidos en esa capa)
+Aplicas un proceso iterativo de difusión de mensajes entre las redes: la similitud en una capa se actualiza usando información de las otras capas, y esto se repite hasta converger
+El resultado es una única red de similitud fusionada, donde dos pacientes están fuertemente conectados si son similares de forma consistente a través de múltiples capas (no solo en una)
+Por qué es complementario a MOFA2 (no competidor)
+MOFA2 te da factores continuos interpretables (bueno para regresión/supervivencia)
+SNF te da una red de similitud entre pacientes, ideal específicamente para clustering/subtipado — es decir, SNF es la herramienta más natural si tu objetivo principal es 
+"encontrar subgrupos de pacientes con perfiles multidimensionales similares" 
+(el famoso paper original de SNF, Wang et al. 2014, Nature Methods, se usó precisamente para subtipar cáncer combinando metilación, expresión y miRNA)
+SNF no maneja datos faltantes tan bien como MOFA2 — necesitas más completitud de datos por paciente
+
+En R
+r
+library(SNFtool)
+
+# 1. Normalizar cada vista por separado (obligatorio)
+genetica_norm    <- standardNormalization(matriz_genetica)
+inmunologia_norm <- standardNormalization(matriz_inmuno)
+clinica_norm     <- standardNormalization(matriz_clinica)
+radiologia_norm  <- standardNormalization(matriz_radiomica)
+
+# 2. Calcular matriz de distancias y de afinidad para cada vista
+K <- 20      # número de vecinos más cercanos
+alpha <- 0.5 # parámetro de difusión (varianza del kernel)
+T_iter <- 20 # número de iteraciones
+
+dist_genetica    <- dist2(as.matrix(genetica_norm), as.matrix(genetica_norm))
+afinidad_genetica <- affinityMatrix(dist_genetica, K, alpha)
+
+dist_inmuno       <- dist2(as.matrix(inmunologia_norm), as.matrix(inmunologia_norm))
+afinidad_inmuno   <- affinityMatrix(dist_inmuno, K, alpha)
+
+dist_clinica      <- dist2(as.matrix(clinica_norm), as.matrix(clinica_norm))
+afinidad_clinica  <- affinityMatrix(dist_clinica, K, alpha)
+
+dist_radio        <- dist2(as.matrix(radiologia_norm), as.matrix(radiologia_norm))
+afinidad_radio    <- affinityMatrix(dist_radio, K, alpha)
+
+# 3. Fusionar las redes de las 4 vistas
+red_fusionada <- SNF(list(afinidad_genetica, afinidad_inmuno, 
+                           afinidad_clinica, afinidad_radio), K, T_iter)
+
+# 4. Clustering espectral sobre la red fusionada
+num_clusters <- estimateNumberOfClustersGivenGraph(red_fusionada, 2:6)
+grupos_snf <- spectralClustering(red_fusionada, K = num_clusters[[1]])
+
+# 5. Visualizar la red fusionada con los clusters
+displayClustersWithHeatmap(red_fusionada, grupos_snf)
+
+# 6. Evaluar qué tanto aporta cada vista individualmente a la estructura final
+concordancia <- concordanceNetworkNMI(
+  list(afinidad_genetica, afinidad_inmuno, afinidad_clinica, afinidad_radio),
+  grupos_snf
+)
+
+Los grupos_snf resultantes son tus subtipos de pacientes integrando las 4 capas 
+— el siguiente paso es exactamente el mismo que en clustering no supervisado: 
+validar estabilidad (bootstrap)
+y validar clínicamente (¿difieren en progresión, EDSS, tiempo hasta evento?).
+
+
+#############################################################################################
+
+Otros métodos relevantes que deberías conocer (menos centrales, pero aparecen en literatura)
+
+#+++++++++++++++++++++++++++++#
+DIABLO (paquete mixOmics)
+
+Pensado específicamente para integración supervisada: si ya tienes una variable de resultado 
+(ej. progresión sí/no), DIABLO busca componentes en cada vista que no solo correlacionen entre capas, 
+sino que además discriminen el resultado clínico. Es el puente entre MOFA2 (no supervisado) y un clasificador.
+r
+library(mixOmics)
+modelo_diablo <- block.splsda(X = datos_mofa, Y = pacientes$progresion, ncomp = 3)
+
+#+++++++++++++++++++++++++++++#
+iCluster / iClusterBayes
+
+Método bayesiano de integración usado extensamente en TCGA (The Cancer Genome Atlas) 
+para subtipado molecular multiómico. Conceptualmente similar a MOFA2 (factores latentes compartidos) 
+pero con un enfoque probabilístico distinto. Menos flexible con datos faltantes que MOFA2, 
+pero muy establecido en la literatura de subtipado.
+
+#+++++++++++++++++++++++++++++#
+Modelos basados en grafos/redes biológicas
+
+En vez de tratar las variables como una matriz plana, 
+incorporan conocimiento previo (ej. redes de interacción proteína-proteína, vías biológicas) 
+para restringir qué combinaciones de variables tienen sentido biológico. 
+Más complejos de implementar pero pueden dar resultados más interpretables biológicamente.
+
+
+################################################################################################
+
+Cómo se ensambla todo el proyecto (el pipeline completo, de principio a fin)
+
+Esto conecta absolutamente todo lo que hemos visto en la conversación:
+
+Preprocesamiento por capa: normalización, imputación específica de cada tipo de dato (genética, inmunología, clínica, radiología)
+Extracción de features en la capa radiológica: si partes de imágenes crudas, aquí entra deep learning (CNN/U-Net) para obtener volúmenes de lesión, atrofia, etc. como variables tabulares
+Integración multiómica intermedia: MOFA2 (si buscas factores continuos para modelos predictivos) y/o SNF (si buscas subtipos de pacientes)
+
+Validación de la estructura encontrada:
+Si usaste SNF → clustering: validar estabilidad con bootstrap/consenso (lo que vimos antes)
+Si usaste MOFA2 → factores: correlacionar con variables clínicas externas no usadas en el modelo
+Modelo predictivo final sobre los factores/clusters integrados: Cox regularizado o Random Survival Forest para predecir tiempo hasta progresión
+Validación cruzada rigurosa (nested CV) de todo el pipeline, con el tidymodels que montamos, teniendo cuidado de que la integración multiómica en sí misma no "vea" el test set (para evitar leakage también en este paso)
+Interpretación biológica: qué variables de qué capas cargan en los factores/clusters relevantes → esto es lo que se traduce en "parámetros innovadores y reproducibles" que menciona la descripción del puesto
+Un punto crítico de rigor que se pasa por alto con frecuencia
+
+Cuando haces validación cruzada de todo el pipeline, la integración multiómica (MOFA2/SNF) 
+debe re-ejecutarse dentro de cada fold de entrenamiento, no una sola vez sobre todos los datos antes de dividir train/test. 
+Si entrenas MOFA2 con todos los pacientes (incluyendo los que luego usarás como test) 
+y después haces CV solo en el modelo predictivo final, 
+estás filtrando información del test set a través de los factores latentes — 
+un error de leakage sutil pero real, y bastante común en papers de este tipo.
+
+################################################################################################
+
+
+Validación clínica final de los hallazgos
+
+Este es el paso que convierte un resultado computacional interesante en una afirmación clínica defendible. 
+Habrás encontrado, digamos, 3 subtipos de pacientes vía SNF, o un factor de MOFA2 que correlaciona con progresión — 
+ahora hay que demostrar rigurosamente que eso es clínicamente real, no ruido computacional con buena presentación.
+
+
+#####+++++++++++++++++++++++++++++++++++++++++++++++++#####
+Paso 1: Kaplan-Meier — la primera mirada, siempre
+
+Antes de cualquier modelo ajustado, quieres ver las curvas de supervivencia crudas por subgrupo. 
+Es el estándar visual que cualquier revisor clínico va a esperar.
+
+r
+library(survival)
+library(survminer)
+
+# grupos_snf viene del clustering; tiempo/evento de tu cohorte
+datos_km <- data.frame(
+  tiempo = pacientes$tiempo,
+  evento = pacientes$evento,
+  subtipo = factor(grupos_snf)
+)
+
+ajuste_km <- survfit(Surv(tiempo, evento) ~ subtipo, data = datos_km)
+
+ggsurvplot(
+  ajuste_km, data = datos_km,
+  pval = TRUE,               # incluye el p del log-rank directamente en el gráfico
+  risk.table = TRUE,         # tabla de pacientes en riesgo por punto de tiempo — casi obligatoria en papers clínicos
+  conf.int = TRUE,
+  palette = "jco",
+  xlab = "Tiempo (meses)",
+  ylab = "Probabilidad de no progresión",
+  legend.title = "Subtipo",
+  surv.median.line = "hv"
+)
+
+Qué mirar además del p-valor: la tabla de riesgo (risk table) es crítica 
+— si un subgrupo se queda con muy pocos pacientes a partir de cierto punto de tiempo, 
+las diferencias en la cola de la curva son poco fiables aunque se vean dramáticas visualmente.
+
+#####+++++++++++++++++++++++++++++++++++++++++++++++++#####
+
+Paso 2: Log-rank test — la prueba formal de diferencia global
+
+r
+diferencia_global <- survdiff(Surv(tiempo, evento) ~ subtipo, data = datos_km)
+diferencia_global
+
+Limitaciones importantes del log-rank que debes tener presentes:
+
+Asume que las curvas no se cruzan (si un subgrupo progresa más rápido al principio pero luego se estabiliza mientras otro lo alcanza, 
+el log-rank pierde potencia porque promedia diferencias a lo largo de todo el seguimiento). 
+Si sospechas esto, revisa las curvas visualmente antes de confiar solo en el p-valor.
+Con 3+ subgrupos, el log-rank te da una prueba global ("hay diferencia en algún lugar"), 
+pero no te dice entre qué pares de subtipos está la diferencia. Para eso:
+
+r
+# Comparaciones por pares con corrección por comparaciones múltiples
+pairwise_survdiff(Surv(tiempo, evento) ~ subtipo, data = datos_km,
+                   p.adjust.method = "BH")  # Benjamini-Hochberg
+
+
+#####+++++++++++++++++++++++++++++++++++++++++++++++++#####
+
+Paso 3: el paso que MÁS se olvida — ajustar por confusores en Cox multivariable
+
+Este es el punto crítico. Encontrar que las curvas KM difieren no es suficiente, 
+porque tu clustering pudo haber capturado, sin querer, 
+algo tan simple como la edad o el tiempo de evolución de la enfermedad (variables que ya sabemos que predicen progresión, 
+y que pueden estar desbalanceadas entre tus subtipos por azar o por estructura de la cohorte). 
+Necesitas demostrar que el subtipo aporta información más allá de lo ya conocido.
+
+r
+# Modelo ajustado: el subtipo debe seguir siendo significativo
+# controlando por variables clínicas ya establecidas
+modelo_ajustado <- coxph(Surv(tiempo, evento) ~ subtipo + edad + 
+                          tiempo_evolucion + EDSS_basal + sexo,
+                          data = pacientes)
+summary(modelo_ajustado)
+
+# Verificar el supuesto de riesgos proporcionales (obligatorio reportar)
+cox.zph(modelo_ajustado)
+
+
+Lo que necesitas poder afirmar: que el Hazard Ratio del subtipo se mantiene significativo 
+(y de magnitud similar) después de ajustar por confusores conocidos. 
+Si el efecto desaparece al ajustar, tu "hallazgo" probablemente solo estaba capturando 
+una variable clínica ya conocida disfrazada de patrón multiómico 
+— un resultado negativo importante de reportar, no de ocultar.
+
+Comparar el valor añadido del subtipo formalmente (no solo mirar si sigue significativo):
+
+r
+modelo_solo_clinico <- coxph(Surv(tiempo, evento) ~ edad + tiempo_evolucion + 
+                              EDSS_basal + sexo, data = pacientes)
+
+# Likelihood ratio test: ¿el subtipo mejora el modelo significativamente?
+anova(modelo_solo_clinico, modelo_ajustado, test = "LRT")
+
+# Diferencia en poder predictivo (C-index)
+concordance(modelo_solo_clinico)
+concordance(modelo_ajustado)
+
+Esta comparación de C-index (modelo clínico solo vs. modelo clínico + subtipo multiómico) es exactamente 
+el tipo de evidencia que justifica la frase "parámetros innovadores que llevan la investigación al siguiente nivel" 
+de la descripción del puesto — necesitas poder cuantificar cuánto mejora la predicción al añadir tu hallazgo computacional.
+
+#####+++++++++++++++++++++++++++++++++++++++++++++++++#####
+
+Paso 4: el problema de la comparación múltiple/testing post-hoc (muy relevante aquí)
+
+Este es un riesgo metodológico serio en este tipo de estudios: si probaste varios valores de k en el clustering, 
+varias combinaciones de vistas en SNF, o varios factores de MOFA2, y luego eliges reportar el que dio 
+mejor p-valor con progresión, estás inflando artificialmente la significancia (el clásico problema de p-hacking, aunque sea no intencional).
+
+Soluciones:
+
+Idealmente, pre-registra la hipótesis y el número de clusters/factores antes de ver la asociación con el outcome 
+(difícil en investigación exploratoria, pero al menos documenta transparentemente cuántas configuraciones probaste)
+Split de validación: divide la cohorte en un set de "descubrimiento" (donde defines el clustering/factores) 
+y un set de "validación" independiente (donde solo verificas si el patrón ya definido se replica) —
+esto es mucho más convincente que hacer todo en la misma muestra
+Si tienes que probar múltiples factores de MOFA2 contra el outcome, corrige por comparaciones múltiples 
+(Bonferroni o BH) igual que harías con múltiples genes
+
+
+#####+++++++++++++++++++++++++++++++++++++++++++++++++#####
+
+
+Paso 5: validación externa (el estándar de oro, si es posible)
+
+Si tienes acceso a una segunda cohorte independiente (otro centro, otra base de datos de EM), el paso más convincente es:
+
+Definir el subtipo/factor en la cohorte de descubrimiento
+Asignar a los pacientes de la cohorte externa a esos mismos subtipos (no re-clusterizar desde cero —
+hay que "predecir" el cluster con el modelo ya entrenado, ej. con el centroide más cercano o el clasificador equivalente)
+Repetir KM + log-rank + Cox ajustado en esa cohorte externa
+r
+# Ejemplo conceptual: asignar nuevos pacientes al cluster más cercano
+# usando los centroides del modelo original (para SNF/k-means)
+library(class)
+nuevos_subtipos <- knn(train = datos_originales_escalados, 
+                        test = datos_externos_escalados,
+                        cl = grupos_snf, k = 5)
+
+Si no tienes cohorte externa, al menos haz validación interna robusta: bootstrap del pipeline completo 
+(re-clusterizar en cada muestra bootstrap y ver si la asociación con el outcome persiste), 
+no solo bootstrap del clustering aislado como vimos antes.
+
+#####+++++++++++++++++++++++++++++++++++++++++++++++++#####
+
+
+Paso 6: tamaño del efecto, no solo significancia
+
+Con cohortes de EM, un p-valor significativo puede coexistir con un efecto clínicamente irrelevante, 
+o viceversa (n pequeño con efecto real pero sin potencia para significancia). 
+Reporta siempre:
+
+Hazard Ratio con intervalo de confianza (no solo el p-valor)
+Diferencia en mediana de tiempo hasta progresión entre subtipos (surv_median() en survminer) —
+mucho más interpretable clínicamente que un HR abstracto
+Número necesario a tratar/identificar si el hallazgo tiene implicación terapéutica
+
+r
+surv_median(ajuste_km)  # mediana de tiempo hasta progresión por subtipo, con IC
+
+#####+++++++++++++++++++++++++++++++++++++++++++++++++#####
+#####+++++++++++++++++++++++++++++++++++++++++++++++++#####
+#####+++++++++++++++++++++++++++++++++++++++++++++++++#####
+
+Checklist resumen de lo que un revisor/clínico va a exigir
+Este es el estándar que separa un análisis exploratorio interesante de un hallazgo publicable 
+y clínicamente accionable — que es, en última instancia, 
+lo que describe la oferta de trabajo cuando habla de "parámetros innovadores y reproducibles".
+
+Elemento	                                                                        Por qué es necesario
+Curvas KM + risk table	                                                          Visualización cruda, honesta sobre tamaño muestral en el tiempo
+Log-rank global + pairwise con corrección	                                        Prueba formal de diferencia entre subtipos
+Cox ajustado por confusores conocidos	                                            Demuestra que el hallazgo no es una variable clínica ya conocida disfrazada
+Likelihood ratio test / comparación de C-index	                                  Cuantifica el valor añadido real del hallazgo multiómico
+Verificación de riesgos proporcionales (cox.zph)	                                Supuesto estadístico que hay que reportar, no asumir
+Corrección por comparaciones múltiples si probaste varias configuraciones	        Evita inflar significancia por p-hacking
+Validación externa o bootstrap del pipeline completo	                            Sin esto, el hallazgo es hipótesis-generador, no confirmatorio
+HR con IC + diferencia de medianas, no solo p-valor	                              Comunica relevancia clínica, no solo significancia estadística
+
+#####+++++++++++++++++++++++++++++++++++++++++++++++++#####         
